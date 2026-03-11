@@ -1,151 +1,103 @@
-import json
-import time
-import psycopg2
-from psycopg2.extras import Json
-from kafka import KafkaConsumer
+import logging
+import sys
+import os
 
-# Configuration (Matches docker-compose and README)
-KAFKA_BOOTSTRAP_SERVERS = ["localhost:29092"]
-DATABASE_URL = "postgresql://admin:secret@localhost:5432/cybercontrol"
-KAFKA_GROUP_ID = "ledger-group"
+# Ensure local imports work by adding parent directory to sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-def get_db_connection():
-    """Retries database connection until success."""
-    while True:
-        try:
-            conn = psycopg2.connect(DATABASE_URL)
-            return conn
-        except Exception as e:
-            print(f"Database connection failed ({e}), retrying in 2s...")
-            time.sleep(2)
+from ledger.config import Config
+from ledger.database import Database
+from ledger.handlers import Handlers
+from shared.kafka_client import AuroraConsumer, AuroraProducer
 
-def init_db():
-    """Creates the logs table if it doesn't exist."""
-    print("Initializing database schema...")
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Using the schema from .github/README.md
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS logs (
-        id                  VARCHAR PRIMARY KEY,
-        elastic_index       VARCHAR,
-        timestamp           TIMESTAMPTZ,
-        message             TEXT,
-        service             VARCHAR,
-        host                VARCHAR,
-        environment         VARCHAR,
-        raw_severity        VARCHAR,
-        category            VARCHAR,
-        severity            VARCHAR,
-        tags                JSONB,
-        is_cybersecurity    BOOLEAN,
-        classification_confidence INTEGER,
-        classification_reasoning  TEXT,
-        ai_suggestion       TEXT,
-        attack_vector       TEXT,
-        recurrence_rate     INTEGER,
-        complexity          VARCHAR,
-        auto_fixable        BOOLEAN,
-        requires_human_approval BOOLEAN,
-        proposed_steps      JSONB,
-        correlated_log_ids  JSONB,
-        correlation_insight TEXT,
-        notify_teams        JSONB,
-        resolution_outcome  VARCHAR,
-        resolved_by         VARCHAR,
-        human_approved_by   VARCHAR,
-        step_results        JSONB,
-        incident_id         VARCHAR,
-        processing_stage    VARCHAR,
-        created_at          TIMESTAMPTZ DEFAULT NOW(),
-        updated_at          TIMESTAMPTZ DEFAULT NOW()
-    );
-    """
-    cur.execute(create_table_sql)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("Database schema ready.")
-
-# --- HANDLERS ---
-# You can easily add more handlers here for new topics
-
-def handle_unfiltered_logs(cur, message_value):
-    """Processes messages from 'logs.unfiltered' topic."""
-    log_id = message_value.get('trace.id') or message_value.get('id')
-    if not log_id:
-        return
-
-    print(f"  [Ledger] Persisting unfiltered log: {log_id}")
-    
-    sql = """
-    INSERT INTO logs (id, timestamp, message, service, raw_severity, processing_stage)
-    VALUES (%s, %s, %s, %s, %s, 'unfiltered')
-    ON CONFLICT (id) DO UPDATE SET
-        updated_at = NOW();
-    """
-    cur.execute(sql, (
-        log_id,
-        message_value.get('@timestamp'),
-        message_value.get('message'),
-        message_value.get('service.name'),
-        message_value.get('log.level'),
-    ))
-
-def handle_categories(cur, message_value):
-    """Processes messages from 'logs.categories' topic."""
-    # (Future implementation)
-    print(f"  [Ledger] Categorization update for log: {message_value.get('id')}")
-    pass
-
-# --- ROUTING SYSTEM ---
-
-TOPIC_HANDLERS = {
-    "logs.unfiltered": handle_unfiltered_logs,
-    "logs.categories": handle_categories,
-}
+# Configure logging
+logging.basicConfig(
+    level=Config.LOG_LEVEL,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("Ledger")
 
 def main():
-    init_db()
+    logger.info("--- Aurora Normalized Ledger Service ---")
     
-    topics = list(TOPIC_HANDLERS.keys())
-    print(f"Connecting to Kafka at {KAFKA_BOOTSTRAP_SERVERS}...")
-    print(f"Subscribing to topics: {topics}")
+    # Initialize Database
+    db = Database()
+    if Config.DROP_DB:
+        db.drop_schema()
+    db.init_schema()
     
-    consumer = KafkaConsumer(
-        *topics,
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=KAFKA_GROUP_ID,
-        auto_offset_reset='earliest',
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        api_version=(3, 4, 0)
+    # Initialize Kafka Consumer
+    group_id = Config.KAFKA_GROUP_ID
+    topics = [t for t in Config.TOPICS if t not in Config.EXCLUDE_TOPICS]
+    
+    if Config.SCRAPE_FROM_BEGINNING:
+        import uuid
+        group_id = f"{Config.KAFKA_GROUP_ID}-scrape-{uuid.uuid4().hex[:8]}"
+        logger.info(f"SCRAPE_FROM_BEGINNING enabled. Using unique group_id: {group_id}")
+        logger.info(f"Scraping from the beginning of topics: {topics}")
+        if Config.EXCLUDE_TOPICS:
+            logger.info(f"Excluded topics: {Config.EXCLUDE_TOPICS}")
+
+    consumer = AuroraConsumer(
+        topics=topics,
+        group_id=group_id,
+        bootstrap_servers=Config.KAFKA_BROKERS,
+        auto_offset='earliest'
     )
 
-    db_conn = get_db_connection()
-    
-    print("Ledger is active and listening...")
+    # Initialize Kafka Producer for sending responses to actions
+    producer = AuroraProducer(
+        bootstrap_servers=Config.KAFKA_BROKERS
+    )
+
+    topic_routing = {
+        "logs.unfiltered": Handlers.handle_unfiltered_logs,
+        "events.correlated": Handlers.handle_correlated_events,
+        "logs.categories": Handlers.handle_categories,
+        "logs.solver_plan": Handlers.handle_solver_plan,
+        "logs.solution": Handlers.handle_solution,
+        "actions": Handlers.handle_actions,
+        "analytics": Handlers.handle_analytics
+    }
+
+    logger.info(f"Subscribed to topics: {topics}")
+
+    message_count = 0
+    topic_counts = {t: 0 for t in topics}
+
     try:
         for message in consumer:
             topic = message.topic
-            handler = TOPIC_HANDLERS.get(topic)
+            handler = topic_routing.get(topic)
             
-            if handler:
-                with db_conn.cursor() as cur:
-                    try:
-                        handler(cur, message.value)
-                        db_conn.commit()
-                    except Exception as e:
-                        print(f"Error processing message from {topic}: {e}")
-                        db_conn.rollback()
-            else:
-                print(f"Warning: No handler for topic {topic}")
+            if not handler:
+                continue
+
+            # Process with transaction management
+            try:
+                with db.get_cursor() as cur:
+                    if topic == "actions":
+                        handler(cur, message, producer)
+                    else:
+                        handler(cur, message)
+                    db.commit()
+                
+                message_count += 1
+                topic_counts[topic] += 1
+                if message_count % 10 == 0:
+                    stats_str = ", ".join([f"{t}: {c}" for t, c in topic_counts.items() if c > 0])
+                    logger.info(f"Progress: Processed {message_count} messages total. ({stats_str})")
+                    
+            except Exception as e:
+                logger.error(f"Error processing {topic}: {e}")
+                db.rollback()
 
     except KeyboardInterrupt:
-        print("\nStopping ledger...")
+        logger.info("Stopping Ledger service...")
     finally:
         consumer.close()
-        db_conn.close()
+        producer.close()
+        db.close()
 
 if __name__ == "__main__":
     main()
