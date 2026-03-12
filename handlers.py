@@ -305,6 +305,10 @@ class Handlers:
         action = val.get("action")
         requester = val.get("requester")
         
+        # Ignore responses (usually sent by Ledger itself)
+        if action and action.startswith("response_"):
+            return
+        
         logger.info(f"Incoming action request: {action} from {requester}")
 
         if action == "get_last_unfiltered_timestamp":
@@ -316,11 +320,11 @@ class Handlers:
             
             # Handle string vs datetime
             if isinstance(ts_val, str):
-                 timestamp = ts_val
+                timestamp = ts_val
             elif ts_val:
-                 timestamp = ts_val.isoformat().replace('+00:00', 'Z')
+                timestamp = ts_val.isoformat().replace('+00:00', 'Z')
             else:
-                 timestamp = "1970-01-01T00:00:00.000Z"
+                timestamp = "1970-01-01T00:00:00.000Z"
             
             payload = {
                 "action": "response_last_unfiltered_timestamp",
