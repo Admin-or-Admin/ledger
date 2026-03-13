@@ -1,4 +1,6 @@
+./shared
 kafka-python-ng
+python-json-logger
 psycopg2-binary
 python-dotenv
 

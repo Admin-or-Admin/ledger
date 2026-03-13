@@ -1,24 +1,17 @@
-import logging
 import sys
 import os
 
-# Ensure local imports work by adding parent directory to sys.path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from shared.logger import setup_logger
 from ledger.config import Config
 from ledger.database import Database
 from ledger.handlers import Handlers
 from shared.kafka_client import AuroraConsumer, AuroraProducer
 
-# Configure logging
-logging.basicConfig(
-    level=Config.LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("Ledger")
+# Initialize standardized logger
+logger = setup_logger("ledger")
 
 def main():
-    logger.info("--- Aurora Normalized Ledger Service ---")
+    logger.info("Aurora Normalized Ledger Service starting")
     
     # Initialize Database
     db = Database()
@@ -33,7 +26,7 @@ def main():
     if Config.SCRAPE_FROM_BEGINNING:
         import uuid
         group_id = f"{Config.KAFKA_GROUP_ID}-scrape-{uuid.uuid4().hex[:8]}"
-        logger.info(f"SCRAPE_FROM_BEGINNING enabled. Using unique group_id: {group_id}")
+        logger.info(f"SCRAPE_FROM_BEGINNING enabled. Using unique group_id: {group_id}", extra={"new_group_id": group_id})
         logger.info(f"Scraping from the beginning of topics: {topics}")
         if Config.EXCLUDE_TOPICS:
             logger.info(f"Excluded topics: {Config.EXCLUDE_TOPICS}")
@@ -86,10 +79,13 @@ def main():
                 topic_counts[topic] += 1
                 if message_count % 10 == 0:
                     stats_str = ", ".join([f"{t}: {c}" for t, c in topic_counts.items() if c > 0])
-                    logger.info(f"Progress: Processed {message_count} messages total. ({stats_str})")
+                    logger.info("Batch processing progress", extra={
+                        "total_processed": message_count,
+                        "counts": topic_counts
+                    })
                     
             except Exception as e:
-                logger.error(f"Error processing {topic}: {e}")
+                logger.error(f"Error processing {topic}: {e}", exc_info=True, extra={"topic": topic})
                 db.rollback()
 
     except KeyboardInterrupt:
